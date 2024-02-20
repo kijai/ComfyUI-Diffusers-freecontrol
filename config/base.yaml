@@ -5,7 +5,7 @@ sd_config:
   steps: 200                      # Diffusion scale
   guidance_scale: 7.5             # Classifier-free guidance scale
   grad_guidance_scale: 1          # Gradient guidance scale, it will be multiplied with the weight in each type of guidance
-  sd_version: '2.1'               # choice from ['2,1'|'2.0'|'1.4']
+  sd_version: '1.4'               # choice from ['2,1'|'2.0'|'1.4']
   dreambooth: null                # Path to dreambooth. Set to null to disable dreambooth
   safetensors: True                # whether to use safetenosr. For most ckpt from civitai.com, they used safetensor format
   same_latent: False            # whether to use the same latent from inversion

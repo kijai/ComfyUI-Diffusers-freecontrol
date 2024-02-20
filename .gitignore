@@ -1,0 +1,12 @@
+wandb/
+*debug*
+debugs/
+outputs/
+__pycache__/
+checkpoints/*
+*.ipynb
+*.safetensors
+*.ckpt
+*.bak
+*.pt
+cached_inversion_latents/

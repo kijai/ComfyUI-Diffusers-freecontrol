@@ -1,0 +1,10 @@
+diffusers >= 0.26.0
+accelerate
+numpy
+safetensors
+tqdm
+transformers >= 4.25.1
+Pillow
+omegaconf
+yaml
+gdown

@@ -9,11 +9,12 @@ from diffusers import StableDiffusionPipeline, DDIMInverseScheduler
 from diffusers.utils import BaseOutput
 from numpy import deprecate
 
-from libs.utils.utils import *
+from ...libs.utils.utils import *
 from .module import prep_unet_conv, prep_unet_attention, get_self_attn_feat
 from .pipeline_utils import _in_step, _classify_blocks
 from .pipelines import *
 
+import comfy.utils
 
 # Take from huggingface/diffusers
 class StableDiffusionPipelineOutput(BaseOutput):
@@ -24,14 +25,9 @@ class StableDiffusionPipelineOutput(BaseOutput):
         images (`List[PIL.Image.Image]` or `np.ndarray`)
             List of denoised PIL images of length `batch_size` or NumPy array of shape `(batch_size, height, width,
             num_channels)`.
-        nsfw_content_detected (`List[bool]`)
-            List indicating whether the corresponding generated image contains "not-safe-for-work" (nsfw) content or
-            `None` if safety checking could not be performed.
     """
 
     images: Union[List[PIL.Image.Image], np.ndarray]
-    nsfw_content_detected: Optional[List[bool]]
-
 
 # Take from huggingface/diffusers
 def rescale_noise_cfg(noise_cfg, noise_pred_text, guidance_rescale=0.0):
@@ -74,19 +70,20 @@ class FreeControlSDPipeline(StableDiffusionPipeline):
             callback_steps: int = 1,
             cross_attention_kwargs: Optional[Dict[str, Any]] = None,
             guidance_rescale: float = 0.0,
-
+            loaded_pca_info: Optional[dict] = None,
+            device: str = "cuda",
             # FreeControl parameters
             config: Optional[Union[Dict[str, Any], omegaconf.DictConfig]] = None,
             inverted_data=None,
     ):
         assert config is not None, "config is required for FreeControl pipeline"
         self.input_config = config
-
+        self.loaded_pca_info = loaded_pca_info
         self.unet = prep_unet_attention(self.unet)
         self.unet = prep_unet_conv(self.unet)
 
-        self.load_pca_info()
-        self.running_device = 'cuda'
+        #self.load_pca_info()
+        self.running_device = device
         self.ref_mask_record = None
 
         # 0. Default height and width to unet
@@ -234,6 +231,7 @@ class FreeControlSDPipeline(StableDiffusionPipeline):
 
         # 7. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
+        pbar = comfy.utils.ProgressBar(num_inference_steps)
         with self.progress_bar(total=num_inference_steps) as progress_bar:
 
             for i, t in enumerate(timesteps):
@@ -256,7 +254,7 @@ class FreeControlSDPipeline(StableDiffusionPipeline):
                     latent_list: List[torch.Tensor] = [latents, data_samples_latent, latents]
                 else:
                     raise NotImplementedError("Currently only support DDIM method")
-
+                               
                 latent_model_input: torch.Tensor = torch.cat(latent_list, dim=0).to('cuda')
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t).detach()
 
@@ -274,9 +272,9 @@ class FreeControlSDPipeline(StableDiffusionPipeline):
                 # Check if the current step is in the guidance step
                 if _in_step(self.guidance_config.pca_guidance, i):
                     require_grad_flag = True
-
-                # Only require grad when need to compute the gradient for guidance
-                if require_grad_flag:
+               
+                # Conditionally enable gradient computation when required
+                if require_grad_flag:    
                     latent_model_input.requires_grad_(True)
                     # predict the noise residual
                     noise_pred = self.unet(
@@ -347,36 +345,31 @@ class FreeControlSDPipeline(StableDiffusionPipeline):
                 # call the callback, if provided
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                     progress_bar.update()
+                    pbar.update(1)
                     if callback is not None and i % callback_steps == 0:
                         callback(i, t, latents)
 
         if not output_type == "latent":
             with torch.no_grad():
                 image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False)[0]
-                image, has_nsfw_concept = self.run_safety_checker(image, device, prompt_embeds.dtype)
         else:
             image = latents
-            has_nsfw_concept = None
 
-        if has_nsfw_concept is None:
-            do_denormalize = [True] * image.shape[0]
-        else:
-            do_denormalize = [not has_nsfw for has_nsfw in has_nsfw_concept]
-
+        do_denormalize = [True] * image.shape[0]
         image = self.image_processor.postprocess(image, output_type=output_type, do_denormalize=do_denormalize)
 
         # Offload all models
         self.maybe_free_model_hooks()
 
         if not return_dict:
-            return (image, has_nsfw_concept)
+            return (image)
 
-        return StableDiffusionPipelineOutput(images=image, nsfw_content_detected=has_nsfw_concept)
+        return StableDiffusionPipelineOutput(images=image)
 
-    def load_pca_info(self):
+    #def load_pca_info(self):
         # Currently only support one pca path
-        path = self.input_config.sd_config.pca_paths[0]
-        self.loaded_pca_info = torch.load(path)
+        #path = self.input_config.sd_config.pca_paths[0]
+        #self.loaded_pca_info = torch.load(path)
 
     def _compute_feat_loss(self, feat, pca_info, cond_control_ids, cond_example_ids, cond_appearance_ids, step,
                            reg_included=False, reg_feature=None, ):
@@ -871,6 +864,7 @@ class FreeControlSDPipeline(StableDiffusionPipeline):
         all_latents = {}
         # 7. Denoising loop where we obtain the cross-attention maps.
         num_warmup_steps = len(timesteps) - num_inference_steps * self.inverse_scheduler.order
+        pbar = comfy.utils.ProgressBar(num_inference_steps)
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 timestep_key = t.detach().cpu().item()
@@ -900,6 +894,7 @@ class FreeControlSDPipeline(StableDiffusionPipeline):
                         (i + 1) > num_warmup_steps and (i + 1) % self.inverse_scheduler.order == 0
                 ):
                     progress_bar.update()
+                    pbar.update(1)
                     if callback is not None and i % callback_steps == 0:
                         callback(i, t, latents)
 
@@ -1028,6 +1023,7 @@ class FreeControlSDPipeline(StableDiffusionPipeline):
         latent_list = list(all_latents.chunk(num_batch, dim=0))
         # 7. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
+        pbar = comfy.utils.ProgressBar(num_inference_steps)
         with self.progress_bar(total=num_inference_steps * num_batch) as progress_bar:
             for i, t in enumerate(timesteps):
                 if i >= num_save_steps:
@@ -1064,6 +1060,7 @@ class FreeControlSDPipeline(StableDiffusionPipeline):
                     # call the callback, if provided
                     if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                         progress_bar.update()
+                        pbar.update(1)
                         if callback is not None and i % callback_steps == 0:
                             callback(i, t, latents)
                     latent_list[latent_id] = latents
