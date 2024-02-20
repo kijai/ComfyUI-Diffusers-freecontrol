@@ -48,6 +48,7 @@ class DiffusersFreecontrol:
             "pca_warm_up_step": ("FLOAT", {"default": 0.05, "min": 0, "max": 1, "step": 0.05}),
             "pca_texture_reg_tr": ("FLOAT", {"default": 0.1, "min": 0, "max": 1, "step": 0.1}),
             "pca_texture_reg_factor": ("FLOAT", {"default": 0.1, "min": 0, "max": 1, "step": 0.1}),
+            "keep_model_loaded": ("BOOLEAN", {"default": True}),
             
             },
             
@@ -61,8 +62,9 @@ class DiffusersFreecontrol:
 
     def process(self, image, batch_size, width, height, seed, steps, guidance_scale, prompt, negative_prompt, inversion_prompt, checkpoint, pca_info,
                  pca_guidance_steps, pca_guidance_components, pca_guidance_weight, pca_guidance_normalized, pca_masked_tr, pca_guidance_penalty_factor, 
-                 pca_warm_up_step, pca_texture_reg_tr, pca_texture_reg_factor, paired_objects):
+                 pca_warm_up_step, pca_texture_reg_tr, pca_texture_reg_factor, paired_objects, keep_model_loaded):
         with torch.inference_mode(False):
+            
             comfy.model_management.unload_all_models()
             device = comfy.model_management.get_torch_device()    
 
@@ -76,7 +78,8 @@ class DiffusersFreecontrol:
             
             original_config = OmegaConf.load(os.path.join(script_directory, f"config/v1-inference.yaml"))
             #sdxl_original_config = OmegaConf.load(os.path.join(script_directory, f"config/sd_xl_base.yaml"))
-            if not hasattr(self, 'unet') or self.current_1_5_checkpoint != checkpoint:
+            if not hasattr(self, 'pipeline') or self.pipeline == None or self.current_1_5_checkpoint != checkpoint:
+                
                 print("Loading checkpoint: ", checkpoint)
                 self.current_1_5_checkpoint = checkpoint
                 if model_path.endswith(".safetensors"):
@@ -112,6 +115,19 @@ class DiffusersFreecontrol:
                 self.scheduler = create_scheduler_from_ldm("DPMSolverMultistepScheduler", original_config, state_dict, scheduler_type="ddim")['scheduler']
 
                 del state_dict, converted_unet
+
+                self.pipeline = FreeControlSDPipeline(
+                    vae = self.vae,
+                    text_encoder = self.text_encoder,
+                    tokenizer = self.tokenizer,
+                    unet = self.unet,
+                    scheduler = self.scheduler,
+                    safety_checker = None,
+                    feature_extractor = None,
+                    requires_safety_checker = False,
+                ).to(device).to(dtype)
+
+                self.pipeline.scheduler = CustomDDIMScheduler.from_config(self.scheduler.config)
 
             input_config = {
             # Stable Diffusion Generation Configuration ,
@@ -154,19 +170,6 @@ class DiffusersFreecontrol:
             config = merge_sweep_config(base_config=base_config, update=input_config)
             config = OmegaConf.create(config)
 
-            pipeline = FreeControlSDPipeline(
-                vae = self.vae,
-                text_encoder = self.text_encoder,
-                tokenizer = self.tokenizer,
-                unet = self.unet,
-                scheduler = self.scheduler,
-                safety_checker = None,
-                feature_extractor = None,
-                requires_safety_checker = False,
-            ).to(device).to(dtype)
-
-            pipeline.scheduler = CustomDDIMScheduler.from_config(self.scheduler.config)
-        
             # create a inversion config
             inversion_config = config.data.inversion
 
@@ -174,13 +177,13 @@ class DiffusersFreecontrol:
             pil_image = ToPILImage()(image.squeeze(0).permute(2, 0, 1))
 
             #ddim inversion
-            condition_image_latents = pipeline.invert(img=pil_image, inversion_config=inversion_config)
+            condition_image_latents = self.pipeline.invert(img=pil_image, inversion_config=inversion_config)
             inverted_data = {"condition_input": [condition_image_latents], }
 
             g = torch.Generator()
             g.manual_seed(config.sd_config.seed)
 
-            img_list = pipeline(prompt=config.sd_config.prompt,
+            img_list = self.pipeline(prompt=config.sd_config.prompt,
                                 negative_prompt=config.sd_config.negative_prompt,
                                 num_inference_steps=config.sd_config.steps,
                                 generator=g,
@@ -194,6 +197,12 @@ class DiffusersFreecontrol:
             image_tensor = torch.stack(image_tensors).permute(0, 2, 3, 1)
             batch1 = image_tensor[:batch_size]
             batch2 = image_tensor[batch_size:]
+
+            if not keep_model_loaded:
+                self.pipeline = None
+                inverted_data = None
+                condition_image_latents = None
+                torch.cuda.empty_cache()
 
             return (batch1, batch2,)
 
